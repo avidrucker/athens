@@ -15,7 +15,6 @@
     [athens.subs]
     [athens.util :as util]
     [athens.views :as views]
-    ;;[athens.ws]
     [goog.dom :refer [getElement]]
     [re-frame.core :as rf]
     [reagent.dom :as r-dom]
@@ -35,7 +34,7 @@
   []
   (rf/clear-subscription-cache!)
   (router/init-routes!)
-  (r-dom/render [views/main-panel]
+  (r-dom/render [views/main]
                 (getElement "app")))
 
 

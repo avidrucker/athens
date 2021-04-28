@@ -1,9 +1,10 @@
 (ns athens.events
   (:require
     [athens.db :as db :refer [retract-uid-recursively inc-after dec-after plus-after minus-after]]
-    [athens.keybindings :as keybindings]
+    [athens.patterns :as patterns]
     [athens.style :as style]
     [athens.util :refer [now-ts gen-block-uid]]
+    [athens.views.blocks.textarea-keydown :as textarea-keydown]
     [clojure.string :as string]
     [datascript.core :as d]
     [datascript.transit :as dt]
@@ -45,6 +46,127 @@
   :db/not-synced
   (fn [db [_]]
     (assoc db :db/synced false)))
+
+
+(defn shared-blocks-excl-date-pages
+  [roam-db]
+  (->> (d/q '[:find [?blocks ...]
+              :in $athens $roam
+              :where
+              [$athens _ :block/uid ?blocks]
+              [$roam _ :block/uid ?blocks]
+              [$roam ?e :block/uid ?blocks]
+              [(missing? $roam ?e :node/title)]]
+            @athens.db/dsdb
+            roam-db)))
+
+
+(defn merge-shared-page
+  "If page exists in both databases, but roam-db's page has no children, then do not add the merge block"
+  [shared-page roam-db roam-db-filename]
+  (let [page-athens              (db/get-node-document shared-page)
+        page-roam                (db/get-roam-node-document shared-page roam-db)
+        athens-child-count       (-> page-athens :block/children count)
+        roam-child-count         (-> page-roam :block/children count)
+        new-uid                  (gen-block-uid)
+        today-date-page          (:title (athens.util/get-day))
+        new-children             (conj (:block/children page-athens)
+                                       {:block/string   (str "[[Roam Import]] "
+                                                             "[[" today-date-page "]] "
+                                                             "[[" roam-db-filename "]]")
+                                        :block/uid      new-uid
+                                        :block/children (:block/children page-roam)
+                                        :block/order    athens-child-count
+                                        :block/open     true})
+        merge-pages              (merge page-roam page-athens)
+        final-page-with-children (assoc merge-pages :block/children new-children)]
+    (if (zero? roam-child-count)
+      merge-pages
+      final-page-with-children)))
+
+
+(defn get-shared-pages
+  [roam-db]
+  (->> (d/q '[:find [?pages ...]
+              :in $athens $roam
+              :where
+              [$athens _ :node/title ?pages]
+              [$roam _ :node/title ?pages]]
+            @athens.db/dsdb
+            roam-db)
+       sort))
+
+
+(defn pages
+  [roam-db]
+  (->> (d/q '[:find [?pages ...]
+              :in $
+              :where
+              [_ :node/title ?pages]]
+            roam-db)
+       sort))
+
+
+(defn gett
+  [s x]
+  (not ((set s) x)))
+
+
+(defn not-shared-pages
+  [roam-db shared-pages]
+  (->> (d/q '[:find [?pages ...]
+              :in $ ?fn ?shared
+              :where
+              [_ :node/title ?pages]
+              [(?fn ?shared ?pages)]]
+            roam-db
+            athens.events/gett
+            shared-pages)
+       sort))
+
+
+(defn update-roam-db-dates
+  "Strips the ordinal suffixes of Roam dates from block strings and dates.
+  e.g. January 18th, 2021 -> January 18, 2021"
+  [db]
+  (let [date-pages         (d/q '[:find ?t ?u
+                                  :keys node/title block/uid
+                                  :in $ ?date
+                                  :where
+                                  [?e :node/title ?t]
+                                  [(?date ?t)]
+                                  [?e :block/uid ?u]]
+                                db
+                                patterns/date-block-string)
+        date-block-strings (d/q '[:find ?s ?u
+                                  :keys block/string block/uid
+                                  :in $ ?date
+                                  :where
+                                  [?e :block/string ?s]
+                                  [(?date ?s)]
+                                  [?e :block/uid ?u]]
+                                db
+                                patterns/date-block-string)
+        date-concat        (concat date-pages date-block-strings)
+        tx-data            (map (fn [{:keys [block/string node/title block/uid]}]
+                                  (cond-> {:db/id [:block/uid uid]}
+                                    string (assoc :block/string (patterns/replace-roam-date string))
+                                    title (assoc :node/title (patterns/replace-roam-date title))))
+                                date-concat)]
+    ;;tx-data))
+    (d/db-with db tx-data)))
+
+
+(reg-event-fx
+  :upload/roam-edn
+  (fn [_ [_ transformed-dates-roam-db roam-db-filename]]
+    (let [shared-pages   (get-shared-pages transformed-dates-roam-db)
+          merge-shared   (mapv (fn [x] (merge-shared-page [:node/title x] transformed-dates-roam-db roam-db-filename))
+                               shared-pages)
+          merge-unshared (->> (not-shared-pages transformed-dates-roam-db shared-pages)
+                              (map (fn [x] (db/get-roam-node-document [:node/title x] transformed-dates-roam-db))))
+          tx-data        (concat merge-shared merge-unshared)]
+      {:dispatch [:transact tx-data]})))
 
 
 (reg-event-db
@@ -143,9 +265,15 @@
                                               (compare
                                                 [(get-in new-items [k1 :index]) k2]
                                                 [(get-in new-items [k2 :index]) k1]))) inc-items)]
-      (cond-> {:db (assoc db :right-sidebar/items sorted-items)}
-        (not (:right-sidebar/open db))
-        (assoc :dispatch [:right-sidebar/toggle])))))
+      {:db         (assoc db :right-sidebar/items sorted-items)
+       :dispatch-n [(when (not (:right-sidebar/open db)) [:right-sidebar/toggle])
+                    [:right-sidebar/scroll-top]]})))
+
+
+(reg-event-fx
+  :right-sidebar/scroll-top
+  (fn []
+    {:right-sidebar/scroll-top nil}))
 
 
 (reg-event-fx
@@ -298,8 +426,9 @@
           retract-vecs      (mapcat #(retract-uid-recursively %) sanitize-selected)
           reindex-last-selected-parent (delete-selected sanitize-selected)
           tx-data           (concat retract-vecs reindex-last-selected-parent)]
-      {:dispatch [:transact tx-data]
-       :db       (assoc db :selected/items [])})))
+      {:fx [[:dispatch [:transact tx-data]]
+            [:dispatch [:editing/uid nil]]]
+       :db (assoc db :selected/items [])})))
 
 
 ;; Alerts
@@ -558,18 +687,61 @@
     {:fs/write! nil}))
 
 
+;; resetting ds-conn re-computes all subs and is the cause
+;;    for huge delays when undo/redo is pressed
+;; here is another alternative strategy for undo/redo
+;; Core ideas are inspired from here https://tonsky.me/blog/datascript-internals/
+;;    1. db-before + tx-data = db-after
+;;    2. DataScript DB contains only currently relevant datoms.
+;; 1 is the math that is happening here when you undo/redo but in a much more performant way
+;; 2 asserts that even if you are reapplying same txn over and over only relevant ones will be present
+;;    - and overall size of transit file does not increase
+;; Note: only relevant txns(ones that user deliberately made, not undo/redo ones) go into history
+;; Note: Once session is lost(App is closed) edit history is also lost
+;; Also cmd + z -> cmd + z -> edit something --- future(cmd + shift + z) doesn't work
+;;    - as there is no logical way to assert the future when past has changed hence history is reset
+;;    - very similar to intelli-j edit model or any editor's undo/redo mechanism for that matter
+(defn inverse-tx
+  ([] (inverse-tx false))
+  ([redo?]
+   (let [[tx-m-id datoms] (cond->> @db/history
+                            redo? reverse
+                            true (some (fn [[tx bool datoms]]
+                                         (and ((if redo? not (complement not)) bool) [tx datoms]))))]
+     (reset! db/history (->> @db/history
+                             (map (fn [[tx-id bool datoms]]
+                                    (if (= tx-id tx-m-id)
+                                      [tx-id redo? datoms]
+                                      [tx-id bool datoms])))
+                             doall))
+     (cond->> datoms
+       (not redo?) reverse
+       true (map (fn [datom]
+                   (let [[id attr val _txn sig?] (vec datom)]
+                     [(cond
+                        (and sig? (not redo?)) :db/retract
+                        (and (not sig?) (not redo?)) :db/add
+                        (and sig? redo?) :db/add
+                        (and (not sig?) redo?) :db/retract)
+                      id attr val])))
+       ;; Caveat -- we need a way to signal history watcher if this txn is relevant
+       ;;     - send a dummy datom, this will get added to user's data
+       ;;     - we can easily filter it out while writing to fs but it will have a perf penalty
+       ;;     - Unless we are exporting transit to a common format, this can stay(only one datom -- point 2 mentioned above)
+       ;;           - although a filter while exporting is more strategic -- once in a while op, compared to fs write(very frequent)
+       true (concat [[:db/add "new" :from-undo-redo true]])))))
+
+
 (reg-event-fx
   :undo
   (fn [_ _]
-    (when-let [prev (db/find-prev @db/history #(identical? @db/dsdb %))]
-      {:reset-conn! prev})))
+    {:dispatch [:transact (inverse-tx)]}))
 
 
 (reg-event-fx
   :redo
   (fn [_ _]
-    (when-let [next (db/find-next @db/history #(identical? @db/dsdb %))]
-      {:reset-conn! next})))
+    {:dispatch [:transact (inverse-tx true)]}))
 
 
 (reg-event-fx
@@ -1019,6 +1191,92 @@
       (unindent-multi uids context-root-uid))))
 
 
+(defn drop-link-child
+  "Create a new block with the reference to the source block, as a child"
+  [source target]
+  (let [new-uid               (gen-block-uid)
+        new-string            (str "((" (source :block/uid) "))")
+        new-source-block      {:block/uid new-uid :block/string new-string :block/order 0 :block/open true}
+        reindex-target-parent (inc-after (:db/id target) -1)
+        new-target-parent     {:db/id (:db/id target) :block/children (conj reindex-target-parent new-source-block)}
+        tx-data               [new-source-block
+                               new-target-parent]]
+    tx-data))
+
+
+(reg-event-fx
+  :drop-link/child
+  (fn [_ [_ source target]]
+    {:dispatch [:transact (drop-link-child source target)]}))
+
+
+(defn drop-link-same-parent
+  "Create a new block with the reference to the source block, under the same parent as the source"
+  [kind source parent target]
+  (let [new-uid             (gen-block-uid)
+        new-string          (str "((" (source :block/uid) "))")
+        s-order             (:block/order source)
+        t-order             (:block/order target)
+        target-above?       (< t-order s-order)
+        +or-                (if target-above? + -)
+        above?                (= kind :above)
+        below?                (= kind :below)
+        lower-bound         (cond
+                              (and above? target-above?) (dec t-order)
+                              (and below? target-above?) t-order
+                              :else s-order)
+        upper-bound         (cond
+                              (and above? (not target-above?)) t-order
+                              (and below? (not target-above?)) (inc t-order)
+                              :else s-order)
+        reindex             (d/q '[:find ?ch ?new-order
+                                   :keys db/id block/order
+                                   :in $ % ?+or- ?parent ?lower-bound ?upper-bound
+                                   :where
+                                   (between ?parent ?lower-bound ?upper-bound ?ch ?order)
+                                   [(?+or- ?order 1) ?new-order]]
+                                 @db/dsdb db/rules +or- (:db/id parent) lower-bound upper-bound)
+        new-source-order    (cond
+                              (and above? target-above?) t-order
+                              (and above? (not target-above?)) (dec t-order)
+                              (and below? target-above?) (inc t-order)
+                              (and below? (not target-above?)) t-order)
+        new-source-block      {:block/uid new-uid :block/string new-string :block/order new-source-order}
+        new-parent-children (concat [new-source-block] reindex)
+        new-parent          {:db/id (:db/id parent) :block/children new-parent-children}
+        tx-data             [new-parent]]
+    tx-data))
+
+
+(reg-event-fx
+  :drop-link/same
+  (fn [_ [_ kind source parent target]]
+    {:dispatch [:transact (drop-link-same-parent kind source parent target)]}))
+
+
+(defn drop-link-diff-parent
+  "Add a link to the source block and reorder the target"
+  [kind source target target-parent]
+  (let [new-uid             (gen-block-uid)
+        new-string          (str "((" (source :block/uid) "))")
+        t-order               (:block/order target)
+        new-block             {:block/uid new-uid :block/string new-string :block/order (if (= kind :above)
+                                                                                          t-order
+                                                                                          (inc t-order))}
+        reindex-target-parent (->> (inc-after (:db/id target-parent) (if (= kind :above)
+                                                                       (dec t-order)
+                                                                       t-order))
+                                   (concat [new-block]))
+        new-target-parent     {:db/id (:db/id target-parent) :block/children reindex-target-parent}]
+    [new-target-parent]))
+
+
+(reg-event-fx
+  :drop-link/diff
+  (fn [_ [_ kind source target target-parent]]
+    {:dispatch [:transact (drop-link-diff-parent kind source target target-parent)]}))
+
+
 (defn drop-child
   "Order will always be 0"
   [source source-parent target]
@@ -1118,23 +1376,26 @@
 
 
 (defn drop-bullet
-  [source-uid target-uid kind]
+  [source-uid target-uid kind effect-allowed]
   (let [source        (db/get-block [:block/uid source-uid])
         target        (db/get-block [:block/uid target-uid])
         source-parent (db/get-parent [:block/uid source-uid])
         target-parent (db/get-parent [:block/uid target-uid])
         same-parent?  (= source-parent target-parent)
         event         (cond
-                        (= kind :child) [:drop/child source source-parent target]
-                        same-parent? [:drop/same kind source source-parent target]
-                        (not same-parent?) [:drop/diff kind source source-parent target target-parent])]
+                        (and (= effect-allowed "move") (= kind :child)) [:drop/child source source-parent target]
+                        (and (= effect-allowed "move") same-parent?) [:drop/same kind source source-parent target]
+                        (and (= effect-allowed "move") (not same-parent?)) [:drop/diff kind source source-parent target target-parent]
+                        (and (= effect-allowed "link") (= kind :child)) [:drop-link/child source target]
+                        (and (= effect-allowed "link") same-parent?) [:drop-link/same kind source source-parent target]
+                        (and (= effect-allowed "link") (not same-parent?)) [:drop-link/diff kind source target target-parent])]
     {:dispatch event}))
 
 
 (reg-event-fx
   :drop
-  (fn [_ [_ source-uid target-uid kind]]
-    (drop-bullet source-uid target-uid kind)))
+  (fn [_ [_ source-uid target-uid kind effect-allowed]]
+    (drop-bullet source-uid target-uid kind effect-allowed)))
 
 
 (defn drop-multi-same-parent-all
@@ -1326,7 +1587,8 @@
 (defn text-to-blocks
   [text uid root-order]
   (let [;; Split raw text by line
-        lines       (clojure.string/split-lines text)
+        lines       (->> (clojure.string/split-lines text)
+                         (filter (comp not clojure.string/blank?)))
         ;; Count left offset
         left-counts (->> lines
                          (map #(re-find #"^\s*(-|\*)?" %))
@@ -1339,7 +1601,8 @@
                                    {:db/id        (dec (* -1 idx))
                                     :block/string x
                                     :block/open   true
-                                    :block/uid    (gen-block-uid)}) sanitize)
+                                    :block/uid    (gen-block-uid)})
+                                 sanitize)
         ;; Count blocks
         n           (count blocks)
         ;; Assign parents
@@ -1398,7 +1661,7 @@
     (let [[uid embed-id]  (db/uid-and-embed-id uid)
           block         (db/get-block [:block/uid uid])
           {:block/keys  [order children open]} block
-          {:keys [start value]} (keybindings/destruct-target js/document.activeElement) ; TODO: coeffect
+          {:keys [start value]} (textarea-keydown/destruct-target js/document.activeElement) ; TODO: coeffect
           empty-block?  (and (string/blank? value)
                              (empty? children))
           block-start?  (zero? start)
@@ -1433,6 +1696,30 @@
                             n     (count string)]
                         [:editing/uid (cond-> uid
                                         embed-id (str "-embed-" embed-id)) n]))]})))
+
+
+(reg-event-fx
+ :paste-verbatim
+ (fn [_ [_ uid text]]
+   (let [{:keys [start value]} (textarea-keydown/destruct-target js/document.activeElement)
+         block-empty?          (string/blank? value)
+         block-start?          (zero? start)
+         new-string            (cond
+
+                                 block-empty?
+                                 text
+
+                                 (and (not block-empty?)
+                                      block-start?)
+                                 (str text value)
+
+                                 :else
+                                 (str (subs value 0 start)
+                                      text
+                                      (subs value start)))
+         tx-data [{:db/id        [:block/uid uid]
+                   :block/string new-string}]]
+     {:dispatch [:transact tx-data]})))
 
 
 (defn left-sidebar-drop-above

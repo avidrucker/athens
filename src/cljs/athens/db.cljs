@@ -31,7 +31,9 @@
 
 ;; -- re-frame -----------------------------------------------------------
 
-(defonce rfdb {:user                "Socrates"
+(defonce rfdb {:user                {:name (or (js/localStorage.getItem "user/name")
+                                               "Socrates")}
+
                :db/filepath         nil
                :db/synced           true
                :db/mtime            nil
@@ -250,12 +252,16 @@
 
 
 (def block-document-pull-vector
-  '[:db/id :block/uid :block/string :block/open :block/order {:block/children ...} :block/refs :block/_refs])
+  '[:db/id :block/uid :block/string :block/open :block/order :block/header {:block/children ...} :block/refs :block/_refs])
 
 
 (def node-document-pull-vector
   (-> block-document-pull-vector
       (conj :node/title :page/sidebar)))
+
+
+(def roam-node-document-pull-vector
+  '[:node/title :block/uid :block/string :block/open :block/order {:block/children ...}])
 
 
 (defn get-block-document
@@ -265,8 +271,17 @@
 
 
 (defn get-node-document
-  [id]
-  (->> @(pull dsdb node-document-pull-vector id)
+  ([id]
+   (->> @(pull dsdb node-document-pull-vector id)
+        sort-block-children))
+  ([id db]
+   (->> (d/pull db node-document-pull-vector id)
+        sort-block-children)))
+
+
+(defn get-roam-node-document
+  [id db]
+  (->> (d/pull db roam-node-document-pull-vector id)
        sort-block-children))
 
 
@@ -524,45 +539,28 @@
 
 ;; history
 
-(defonce history (atom []))
-(def ^:const history-limit 10)
+(defonce history (atom '()))
+#_(def ^:const history-limit 10)
 
-
-(defn drop-tail
-  [xs pred]
-  (loop [acc []
-         xs  xs]
-    (let [x (first xs)]
-      (cond
-        (nil? x) acc
-        (pred x) (conj acc x)
-        :else  (recur (conj acc x) (next xs))))))
-
-
-(defn trim-head
-  [xs n]
-  (vec (drop (- (count xs) n) xs)))
-
-
-(defn find-prev
-  [xs pred]
-  (last (take-while #(not (pred %)) xs)))
-
-
-(defn find-next
-  [xs pred]
-  (fnext (drop-while #(not (pred %)) xs)))
-
-
+;; this gives us customization options
+;; now if there is a pattern for a tx then the datoms can be
+;; easily modified(mind the order of datoms) to add a custom undo/redo strategy
+;; Not seeing a use case now, but there is an option to do it
 (d/listen! dsdb :history
            (fn [tx-report]
-             (let [{:keys [db-before db-after]} tx-report]
-               (when (and db-before db-after)
-                 (swap! history (fn [h]
-                                  (-> h
-                                      (drop-tail #(identical? % db-before))
-                                      (conj db-after)
-                                      (trim-head history-limit))))))))
+             (when-not (or (->> tx-report :tx-data (some (fn [datom]
+                                                           (= (nth datom 1)
+                                                              :from-undo-redo))))
+                           (->> tx-report :tx-data empty?))
+               (swap! history (fn [buff]
+                                (->> buff (remove (fn [[_ applied? _]]
+                                                    (not applied?)))
+                                     doall)))
+               (swap! history (fn [cur-his]
+                                (cons [(-> tx-report :tx-data first vec (nth 3))
+                                       true
+                                       (:tx-data tx-report)]
+                                      cur-his))))))
 
 ;; -- Linked & Unlinked References ----------
 
